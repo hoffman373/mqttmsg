@@ -1,0 +1,33 @@
+# Not currently runnable here — no clang, clang-tidy or scan-build is
+# installed on the development machine, so `make lint` uses GCC's analyzer
+# instead (see CMakeLists.txt). This config is here so that a machine with
+# clang can run `run-clang-tidy -p <build-dir> src/mqttmsg` and get the same
+# classes of finding without re-deriving the settings.
+#
+# The checks below are the ones that would have caught bugs this project
+# actually had:
+#   clang-analyzer-unix.Malloc     - the parseMessage leaks (#1) and the
+#                                    sendAndClean early-return leak
+#   clang-analyzer-core.*          - unchecked malloc results (#6)
+#   bugprone-suspicious-memory-comparison,
+#   bugprone-not-null-terminated-result
+#                                  - the buildClientId overread (#6)
+#   bugprone-sizeof-expression     - the subscriptions array once sized with
+#                                    sizeof(SubscriptionPayload) (#2)
+
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-err33-c,
+  misc-*,
+  -misc-no-recursion,
+  -bugprone-easily-swappable-parameters
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/mqttmsg/.*'
+FormatStyle: none
+
+CheckOptions:
+  - key: bugprone-assert-side-effect.AssertMacros
+    value: assert

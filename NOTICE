@@ -1,0 +1,30 @@
+mqttmsg
+Copyright (c) 2026, Dustin Hoffman
+
+This product includes software developed by third parties, listed below.
+Their terms apply to those files and travel with them: a consumer that
+vendors this library inherits these obligations too.
+
+
+-------------------------------------------------------------------------
+lib/crypto-algorithms (git submodule)
+-------------------------------------------------------------------------
+
+Author: Brad Conte (brad AT bradconte.com)
+Upstream: https://github.com/B-Con/crypto-algorithms
+
+Released into the public domain free of any restrictions. The author
+requests acknowledgement if the code is used but does not require it; this
+entry is that acknowledgement. Provided free of any liability and without
+any quality claims by the author.
+
+Only sha256.c is compiled into this library. The submodule is not
+distributed inside this repository -- a clone gets it from upstream -- but
+it is part of any build, so it is named here.
+
+Upstream states these are not cryptographically secure implementations and
+have no resistance to side-channel attacks. That is a property of the
+SHA-256 underneath mqttCheckKey()'s HMAC, and worth weighing against a
+threat model that includes an attacker who can measure the device. HMAC's
+proof assumes a compression function that behaves; it says nothing about
+how long that function takes to run.
