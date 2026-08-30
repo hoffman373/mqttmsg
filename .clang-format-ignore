@@ -1,0 +1,8 @@
+# Code we do not own, on the same grounds that exempt it from the warning
+# flags and the analyzer: reformatting it would make its diff against
+# upstream unreadable, which is the only way to review a version bump.
+tests/unity/*
+
+# lib/crypto-algorithms is a submodule and so is not this repo's to format,
+# but list it too — a recursive clang-format run does not know that.
+lib/*

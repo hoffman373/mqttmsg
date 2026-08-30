@@ -1,0 +1,69 @@
+# Doxygen configuration for mqttmsg.
+#
+# Only non-default settings are listed; everything else is whatever the
+# installed doxygen defaults to. Run from the repo root:
+#
+#   doxygen
+#
+# Output lands in docs/html/. Doxygen is not a build dependency — CMake
+# knows nothing about this file, so a consumer that add_subdirectory()s
+# this library is unaffected whether doxygen is installed or not.
+
+PROJECT_NAME           = mqttmsg
+PROJECT_BRIEF          = "MQTT 3.1 client for the Raspberry Pi Pico"
+OUTPUT_DIRECTORY       = docs
+
+# ── Input ─────────────────────────────────────────────────────────────────
+#
+# The third-party SHA-256 implementation (Brad Conte) is a submodule under
+# lib/, which INPUT does not cover, so it stays out of the reference without
+# needing an exclude. tests/ vendors Unity while the test bodies document
+# themselves.
+INPUT                  = README.md include src apps
+RECURSIVE              = YES
+EXCLUDE                = tests
+EXCLUDE_PATTERNS       = */build-*/*
+USE_MDFILE_AS_MAINPAGE = README.md
+
+# ── Parsing ───────────────────────────────────────────────────────────────
+#
+# Primarily C, with two opt-in C++ interop headers.
+OPTIMIZE_OUTPUT_FOR_C  = YES
+JAVADOC_AUTOBRIEF      = YES
+EXTRACT_STATIC         = YES
+TAB_SIZE               = 2
+
+# The internal headers under src/ are in scope, and they mark themselves
+# @internal. Without this, doxygen strips those blocks and then warns that
+# the symbols they documented are undocumented.
+INTERNAL_DOCS          = YES
+
+# The Pico-facing headers include "pico/cyw43_arch.h", which is not on any
+# include path here. With SEARCH_INCLUDES off doxygen skips the missing
+# header and still parses err_t / u16_t / struct pbuf as opaque type names,
+# so no PREDEFINED substitutions are needed.
+SEARCH_INCLUDES        = NO
+
+# heap_stats.h and publishHeapStats() sit behind this; define it so the
+# Pico-only half of that API shows up in the reference.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+PREDEFINED             = MQTTMSG_TARGET_PICO=1
+
+# ── Completeness gate ─────────────────────────────────────────────────────
+#
+# EXTRACT_ALL stays NO on purpose: with it on, an undocumented symbol is
+# silently published with an empty description. Off, it warns, so the docs
+# either stay complete or the run says which symbol slipped.
+EXTRACT_ALL            = NO
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = YES
+
+# ── Output ────────────────────────────────────────────────────────────────
+GENERATE_LATEX         = NO
+GENERATE_HTML          = YES
+HTML_DYNAMIC_SECTIONS  = YES
+SORT_MEMBER_DOCS       = NO
+HAVE_DOT               = YES
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
