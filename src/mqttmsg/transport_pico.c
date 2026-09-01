@@ -63,6 +63,13 @@ struct MqttPicoTransport {
      */
     absolute_time_t retryAfter;
     absolute_time_t connectedAt; /**< When the transport last connected. */
+    /**
+     * The state the last poll ended on, so a transition made between polls is
+     * still seen. ::MqttPicoConnected is reached from an lwIP callback, which
+     * under the threadsafe-background arch almost never lands inside the poll
+     * that would have noticed it.
+     */
+    MqttPicoState reportedState;
 };
 
 /* Forward declarations; each is documented at its definition below. */
@@ -79,7 +86,7 @@ static const char *errToString(err_t toConvert);
  * @return A static string; `"UNKNOWN"` for an unrecognised code.
  */
 /* Forward declaration; documented at its definition below. */
-static void dropConnection(MqttPicoTransport *state);
+static err_t dropConnection(MqttPicoTransport *state);
 
 static const char *status_name(int status) {
     switch (status) {
@@ -110,6 +117,7 @@ static MqttPicoTransport *allocateTransport(void) {
     }
 
     returnValue->state = MqttPicoDisconnected;
+    returnValue->reportedState = MqttPicoDisconnected;
     backoffInit(&returnValue->backoff, RECONNECT_BACKOFF_MIN_MS, RECONNECT_BACKOFF_MAX_MS,
                 SESSION_HEALTHY_MS);
     returnValue->retryAfter = get_absolute_time();
@@ -145,8 +153,16 @@ static struct tcp_pcb *getPcb(MqttPicoTransport *state) { return state->tcp_pcb;
 static bool openConnection(MqttPicoTransport *state) {
     mqttmsgDebugPrint("Connecting to %s port %u\n", ip4addr_ntoa(&state->server_address),
                       mqttBrokerPort(state->client));
+    /* cyw43_arch_lwip_begin/end has to bracket every call into lwIP made from
+       the run loop, not just the connect: allocating the PCB and hanging
+       callbacks off it touch the same structures the background context is
+       working in. Calls from inside an lwIP callback may be bracketed too,
+       which is what lets the teardown path below share one function. */
+    cyw43_arch_lwip_begin();
+
     state->tcp_pcb = tcp_new_ip_type(IP_GET_TYPE(&state->server_address));
     if (!state->tcp_pcb) {
+        cyw43_arch_lwip_end();
         mqttmsgErrorPrint("failed to create pcb\n");
         return false;
     }
@@ -159,11 +175,6 @@ static bool openConnection(MqttPicoTransport *state) {
     tcp_recv(state->tcp_pcb, handleReceiveData);
     tcp_sent(state->tcp_pcb, handleSendData);
 
-    // cyw43_arch_lwip_begin/end should be used around calls into lwIP to ensure correct locking.
-    // You can omit them if you are in a callback from lwIP. Note that when using pico_cyw_arch_poll
-    // these calls are a no-op and can be omitted, but it is a good practice to use them in
-    // case you switch the cyw43_arch type later.
-    cyw43_arch_lwip_begin();
     err_t err = tcp_connect(state->tcp_pcb, &state->server_address, mqttBrokerPort(state->client),
                             clientConnected);
     cyw43_arch_lwip_end();
@@ -223,8 +234,7 @@ static err_t handleReceiveData(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
 
     if (!p) {
         /* The peer closed. */
-        dropConnection(state);
-        return ERR_OK;
+        return dropConnection(state);
     }
 
     /* This is called from lwIP, so cyw43_arch_lwip_begin is not required;
@@ -240,8 +250,10 @@ static err_t handleReceiveData(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
             mqttmsgErrorPrint("Receive buffer overflow, closing connection.\n");
             mqttResetStream(state->client);
             pbuf_free(p);
-            dropConnection(state);
-            return ERR_BUF;
+            /* An aborted PCB has to be reported as ERR_ABRT whatever else the
+               caller would rather say; lwIP goes on using a PCB it was not
+               told about. */
+            return dropConnection(state) == ERR_ABRT ? ERR_ABRT : ERR_BUF;
         }
 
         /* Copied straight out of the pbuf into the client's buffer rather
@@ -255,8 +267,7 @@ static err_t handleReceiveData(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
                rather than merely short, and no further reading resyncs it. */
             mqttmsgErrorPrint("Malformed MQTT fixed header, closing connection.\n");
             pbuf_free(p);
-            dropConnection(state);
-            return ERR_VAL;
+            return dropConnection(state) == ERR_ABRT ? ERR_ABRT : ERR_VAL;
         }
     }
 
@@ -400,17 +411,32 @@ static err_t clientConnected(void *arg, struct tcp_pcb *tpcb, err_t err) {
  * @param err The error that killed it.
  */
 static void handleError(void *arg, err_t err) {
+    MqttPicoTransport *state = (MqttPicoTransport *)arg;
+
     mqttmsgTracePrint("tcp_client_err %s\n", errToString(err));
 
     // Reset connection.
     mqttmsgDebugPrint("Closing connection\n");
-    dropConnection((MqttPicoTransport *)arg);
+
+    /* lwIP frees the PCB before calling this, so the pointer has to go before
+       dropConnection() reaches for it. Closing it from here handed a freed
+       PCB back to lwIP, which had already reissued the memory to a live
+       connection: the send queue it then unwound was somebody else's. */
+    state->tcp_pcb = NULL;
+    dropConnection(state);
 }
 
-static void dropConnection(MqttPicoTransport *state) {
+static err_t dropConnection(MqttPicoTransport *state) {
     mqttmsgDebugPrint("Client closed, cleaning up.\n");
 
+    err_t closed = ERR_OK;
+
     if (state->tcp_pcb != NULL) {
+        /* Bracketed for the same reason the connect path is: this runs from
+           the run loop as often as from an lwIP callback, and tearing a PCB
+           down underneath the background context corrupts the queues it is
+           in the middle of accounting for. */
+        cyw43_arch_lwip_begin();
         tcp_arg(state->tcp_pcb, NULL);
         tcp_poll(state->tcp_pcb, NULL, 0);
         tcp_sent(state->tcp_pcb, NULL);
@@ -420,8 +446,9 @@ static void dropConnection(MqttPicoTransport *state) {
         if (err != ERR_OK) {
             mqttmsgErrorPrint("close failed %d, calling abort\n", err);
             tcp_abort(state->tcp_pcb);
-            err = ERR_ABRT;
+            closed = ERR_ABRT;
         }
+        cyw43_arch_lwip_end();
         state->tcp_pcb = NULL;
     }
 
@@ -440,6 +467,7 @@ static void dropConnection(MqttPicoTransport *state) {
     mqttmsgDebugPrint("Reconnecting in %ums.\n", waitMs);
 
     updateState(state, MqttPicoDisconnected);
+    return closed;
 }
 
 /**
@@ -580,18 +608,37 @@ static MqttWriteStatus picoWrite(void *ctx, const uint8_t *bytes, uint32_t lengt
 
     cyw43_arch_lwip_begin();
     err_t err = tcp_write(getPcb(state), bytes, (u16_t)length, TCP_WRITE_FLAG_COPY);
+    err_t flushed = ERR_OK;
+    if (err == ERR_OK) {
+        /* tcp_write() only queues. Without this the frame sat in the unsent
+           queue until some unrelated event flushed it, and on a connection
+           whose first frame is the CONNECT no such event ever comes: the
+           broker cannot answer bytes it was never sent. */
+        flushed = tcp_output(getPcb(state));
+    }
     cyw43_arch_lwip_end();
 
-    if (err == ERR_OK) {
-        return MqttWriteOk;
-    }
-
     if (err == ERR_MEM) {
+        /* Nothing was queued, so nothing is owed: the frame is skipped and
+           the connection carries on. */
         return MqttWriteBusy;
     }
 
-    mqttmsgErrorPrint("tcp_write failed (%d).\n", err);
-    return MqttWriteFailed;
+    if (err != ERR_OK) {
+        mqttmsgErrorPrint("tcp_write failed (%d).\n", err);
+        return MqttWriteFailed;
+    }
+
+    if (flushed != ERR_OK) {
+        /* Not reported as busy, because these bytes are already part of the
+           stream and still unsent. Nothing schedules another flush, so the
+           connection is finished either way; failing it reconnects instead of
+           leaving a session that can never speak again. */
+        mqttmsgErrorPrint("tcp_output failed (%d).\n", flushed);
+        return MqttWriteFailed;
+    }
+
+    return MqttWriteOk;
 }
 
 /**
@@ -632,13 +679,23 @@ static void picoPoll(void *ctx, MqttClient *client) {
     MqttPicoTransport *state = (MqttPicoTransport *)ctx;
     (void)client;
 
-    MqttPicoState before = state->state;
+    MqttPicoState before = state->reportedState;
     advanceConnection(state);
+    /* Recorded before the CONNECT goes out, because sending it can fail and
+       take the connection straight back down. */
+    state->reportedState = state->state;
 
     /* The CONNECT goes out when TCP has just come up, and only then: lwIP
        reports the transition once, and repeating it would open a second
-       session over the first. */
-    if (state->state == MqttPicoConnected && before != MqttPicoConnected) {
+       session over the first.
+
+       Compared against the state the previous poll ended on rather than the
+       one this poll started with. clientConnected() runs in the background
+       context, so the move to MqttPicoConnected almost always lands between
+       polls; a local snapshot taken at the top of this function saw the same
+       value either side of advanceConnection(), swallowed the transition,
+       and left the client connected at TCP with no CONNECT ever sent. */
+    if (state->reportedState == MqttPicoConnected && before != MqttPicoConnected) {
         mqttConnectionUp(state->client);
     }
 }
